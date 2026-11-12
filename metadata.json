@@ -1,0 +1,6 @@
+{
+  "name": "Quran Tasheeh — Güclü Səs Tanıma",
+  "description": "Quran Tasheeh — Quranı yüksək həssaslıqlı mikrofonla oxu, gücləndirilmiş səs tutma (Ultra AGC + DSP), səhv və təcvid yoxlaması.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
