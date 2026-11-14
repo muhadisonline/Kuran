@@ -5,13 +5,30 @@ import {
 import {
   DetectedMistake,
   MistakeKind,
+  RealRecitationScore,
   ZipformerWordVerdict,
   analyzeSpokenVsExpected,
-  evaluateVerdictMistakes,
+  computeRealRecitationScore,
+  detectCompletedMistakesFromVerdicts,
+  diagnosePerWordPhonemeMakhraj,
+  evaluateTajweedFindingsForMistakes,
   getReciterAyahAudioUrl,
   judgeAttemptTilawi,
+  normalizeZipformerTranscript,
   overlapMerge,
 } from './mistakeDetector';
+import {
+  RawEngineTajweedItem,
+  RecitationSessionRecord,
+  aggregateWeakAreas,
+  appendSessionHistory,
+  buildSessionRecord,
+  clearRecitationHistoryStorage,
+  formatTajweedFindingAz,
+  getArticulationTipAz,
+  loadRecitationHistory,
+  saveRecitationHistory,
+} from './sessionAnalytics';
 
 export interface CueWordInfo {
   surah: number;
@@ -51,10 +68,15 @@ export interface TartilGlobalApi {
     heardWord?: string;
     titleAz?: string;
   }) => void;
+  enrichMistakeNote?: (surah: number, ayah: number, word: number, note: string) => boolean;
   retrySpot?: (surah: number, ayah: number, word?: number) => void;
   getMistakes?: () => TartilMistakeRecord[];
   clearMistakes?: () => void;
   getVerdicts?: () => ZipformerWordVerdict[];
+  getTranscript?: () => string;
+  markWarnWord?: (surah: number, ayah: number, word: number) => void;
+  hasClip?: (surah: number, ayah: number) => boolean;
+  playMine?: (surah: number, ayah: number) => void;
   getState: () => {
     page: number;
     mic: boolean;
@@ -78,6 +100,10 @@ declare global {
     __tartilVoiceConfig?: WorkletVoiceConfig;
     __setTartilVoiceConfig?: (cfg: WorkletVoiceConfig) => void;
     __onTartilRms?: (rms: number) => void;
+    __tj?: {
+      found?: RawEngineTajweedItem[];
+      stats?: number[];
+    };
     __tartilMistakeTester?: {
       simulateSpokenArabic: (spokenTranscript: string) => {
         matchedIndices: number[];
@@ -85,6 +111,8 @@ declare global {
       };
       judgeAyahAttempt: (surah: number, ayah: number, heardWords: string[]) => ReturnType<typeof judgeAttemptTilawi>;
       getRecentAlerts: () => MistakeAlertItem[];
+      getRealScore: () => RealRecitationScore;
+      getSessionHistory: () => RecitationSessionRecord[];
       clearAlerts: () => void;
       playReciterAyah: (surah: number, ayah: number) => Promise<void>;
     };
@@ -342,10 +370,20 @@ export function attachHybridVoiceBooster(rootEl: HTMLElement): () => void {
     reciterRow.insertAdjacentElement('afterend', slipHoldRow);
   }
 
-  // 2. Inject quick Voice Boost toggle button & Tilawi Accuracy Score Pill in the bottom bar (.t-bar)
+  // 2. Inject quick Voice Boost toggle, Hifz (Əzbər) toggle, & Real Acoustic Score Pill in the bottom bar (.t-bar)
   const bottomBar = rootEl.querySelector('.t-bar');
   let barBoostBtn: HTMLButtonElement | null = null;
-  let barScorePill: HTMLSpanElement | null = null;
+  let barHifzBtn: HTMLButtonElement | null = null;
+  let barScorePill: HTMLButtonElement | null = null;
+
+  const isHifzActive = () => rootEl.classList.contains('hifz');
+  const syncHifzPillUi = () => {
+    if (!barHifzBtn) return;
+    const on = isHifzActive();
+    barHifzBtn.classList.toggle('active', on);
+    barHifzBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    barHifzBtn.textContent = on ? 'Əzbər ✓' : 'Əzbər';
+  };
 
   if (bottomBar && !bottomBar.querySelector('.t-boost-pill')) {
     const pillWrap = document.createElement('div');
@@ -353,31 +391,441 @@ export function attachHybridVoiceBooster(rootEl: HTMLElement): () => void {
 
     barBoostBtn = document.createElement('button');
     barBoostBtn.type = 'button';
+    barBoostBtn.dir = 'ltr';
     barBoostBtn.className = `t-boost-pill ${currentBoost === 'ultra' ? 'ultra' : ''}`;
     barBoostBtn.setAttribute('aria-label', 'Səs tutma gücü');
     barBoostBtn.title = 'Mikrofon səs tutma gücünü dəyişdir (Güclü / Çox güclü / Ultra)';
 
-    barScorePill = document.createElement('span');
-    barScorePill.className = 't-score-pill';
-    barScorePill.title = 'Tilawi / Minhajy canlı qiraət dəqiqliyi';
-    barScorePill.textContent = '100%';
+    barHifzBtn = document.createElement('button');
+    barHifzBtn.type = 'button';
+    barHifzBtn.dir = 'ltr';
+    barHifzBtn.className = 't-hifz-pill';
+    barHifzBtn.title = 'Hifz (Əzbər) rejimini aç/bağla — sözləri gizlədərək oxu';
+    syncHifzPillUi();
+
+    barScorePill = document.createElement('button');
+    barScorePill.type = 'button';
+    barScorePill.dir = 'ltr';
+    barScorePill.id = 'tartil-accuracy-badge';
+    barScorePill.className = 't-score-pill idle';
+    barScorePill.title = 'Real akustik nəticəni, təcvidi və tarixçəni aç';
+    barScorePill.textContent = 'Nəticə: —';
 
     pillWrap.appendChild(barBoostBtn);
+    pillWrap.appendChild(barHifzBtn);
     pillWrap.appendChild(barScorePill);
     bottomBar.appendChild(pillWrap);
   }
 
+  // Session verdict cache preserves real acoustic metrics across ayah/page transitions
+  const sessionVerdictCache = new Map<string, ZipformerWordVerdict>();
+  const autoFlaggedKeys = new Set<string>();
+  let lastLiveAcousticTranscript = '';
+  let stitchedWindowWords: string[] = [];
+  let prevMicState = false;
+  let telemetryTab: 'current' | 'history' = 'current';
+  let isGuidedDrillActive = false;
+  let sessionHistory: RecitationSessionRecord[] = loadRecitationHistory();
+
+  // Create Real Acoustic Telemetry Sheet (.t-telemetry-sheet)
+  let telemetrySheet = rootEl.querySelector('.t-telemetry-sheet') as HTMLDivElement | null;
+  if (!telemetrySheet) {
+    telemetrySheet = document.createElement('div');
+    telemetrySheet.className = 't-sheet t-telemetry-sheet';
+    telemetrySheet.hidden = true;
+    telemetrySheet.setAttribute('role', 'dialog');
+    telemetrySheet.setAttribute('aria-label', 'Real akustik nəticələr');
+    rootEl.appendChild(telemetrySheet);
+  }
+
+  const getWordPlainText = (surah: number, ayah: number, wordIdx: number): string => {
+    const words = window.__tartilApi?.getAyahPlainWords?.(surah, ayah);
+    return words && words[wordIdx] ? words[wordIdx] : `Söz ${wordIdx + 1}`;
+  };
+
+  const syncVerdictsFromEngine = (
+    isSessionEnding = false,
+    overrideVerdicts?: ZipformerWordVerdict[],
+    overrideTranscript?: string
+  ) => {
+    const api = window.__tartilApi;
+    if (!api) return;
+    const liveVerdicts = overrideVerdicts ?? api.getVerdicts?.() ?? [];
+    for (const v of liveVerdicts) {
+      if (!v || !v.surah || !v.ayah || v.state === 'pending') continue;
+      const key = `${v.surah}:${v.ayah}:${v.word}`;
+      sessionVerdictCache.set(key, v);
+      if (v.state === 'unsure') {
+        api.markWarnWord?.(v.surah, v.ayah, v.word);
+      }
+    }
+    const tr = overrideTranscript ?? api.getTranscript?.() ?? '';
+    if (tr && tr.trim()) {
+      lastLiveAcousticTranscript = tr.trim();
+    }
+
+    // Evaluate completed ayahs / multi-word skipped spans on settled session verdicts
+    if (api.isMicOn() || isSessionEnding) {
+      const completedMistakes = detectCompletedMistakesFromVerdicts(
+        Array.from(sessionVerdictCache.values()),
+        getWordPlainText,
+        { isSessionEnding, transcript: lastLiveAcousticTranscript }
+      );
+      const existing = api.getMistakes?.() ?? [];
+      for (const m of completedMistakes) {
+        const mKey = `${m.surah}:${m.ayah}:${m.word}`;
+        if (autoFlaggedKeys.has(mKey)) continue;
+        const already = existing.find((e) => e.s === m.surah && e.a === m.ayah && e.w === m.word);
+        if (already) {
+          if (!already.note && m.explanationAz) {
+            api.enrichMistakeNote?.(m.surah, m.ayah, m.word, m.explanationAz);
+          }
+          autoFlaggedKeys.add(mKey);
+          continue;
+        }
+        autoFlaggedKeys.add(mKey);
+        api.flagMistake?.({
+          surah: m.surah,
+          ayah: m.ayah,
+          word: m.word,
+          kind: m.kind,
+          note: m.explanationAz,
+          expectedWord: m.expectedWord,
+          heardWord: m.heardWord,
+          titleAz: m.titleAz,
+        });
+      }
+    }
+  };
+
+  const computeCurrentRealScore = (): RealRecitationScore => {
+    const api = window.__tartilApi;
+    const st = api?.getState?.();
+    const activeMistakes = api?.getMistakes?.() ?? [];
+    const mistakesCount = st?.mistakes ?? activeMistakes.length;
+    const flaggedMap = new Map<string, MistakeKind>();
+    for (const m of activeMistakes) {
+      if (m && m.s && m.a && typeof m.w === 'number' && m.w >= 0) {
+        flaggedMap.set(`${m.s}:${m.a}:${m.w}`, m.kind);
+      }
+    }
+    return computeRealRecitationScore(
+      Array.from(sessionVerdictCache.values()),
+      mistakesCount,
+      getWordPlainText,
+      flaggedMap
+    );
+  };
+
+  const persistCompletedSession = () => {
+    const score = computeCurrentRealScore();
+    const api = window.__tartilApi;
+    const activeMistakes = api?.getMistakes?.() ?? [];
+    const nextRec = buildSessionRecord({
+      page: api?.getPage?.() ?? 1,
+      score,
+      mistakes: activeMistakes,
+    });
+    if (!nextRec) return;
+    const updated = appendSessionHistory(sessionHistory, nextRec);
+    if (updated !== sessionHistory) {
+      sessionHistory = updated;
+      saveRecitationHistory(sessionHistory);
+    }
+  };
+
+  const renderTelemetrySheet = () => {
+    if (!telemetrySheet || telemetrySheet.hidden) return;
+    const score = computeCurrentRealScore();
+    const asrSpeech = stitchedWindowWords.slice(-18).join(' ').trim();
+    const acousticText = lastLiveAcousticTranscript || asrSpeech;
+    const api = window.__tartilApi;
+    const activeMistakes = api?.getMistakes?.() ?? [];
+
+    const rowsHtml =
+      score.breakdowns.length === 0
+        ? `<div class="t-tel-empty">Hələ heç bir söz akustik model tərəfindən qiymətləndirilməyib. Mikrofonu açıb qiraətə başladıqda burada hər sözün real məsafəsi, GOP balı və dəqiq faizi görünəcək.</div>`
+        : score.breakdowns
+            .slice()
+            .reverse()
+            .map((b) => {
+              const isSevereTag =
+                b.reasonTag === 'Məxrəc' ||
+                b.reasonTag === 'Buraxılıb' ||
+                b.reasonTag === 'Xəta' ||
+                b.reasonTag === 'GOP' ||
+                b.reasonTag === 'Neyron';
+              const badgeCls =
+                b.reasonTag === 'Təkrar'
+                  ? 'repeat'
+                  : b.state === 'wrong' || b.state === 'skipped' || isSevereTag
+                    ? 'bad'
+                    : b.reasonTag === 'Hərəkə' || b.state === 'unsure' || b.wordScorePercent < 82
+                      ? 'warn'
+                      : 'ok';
+              const badgeLbl = b.reasonTag || (b.wordScorePercent < 82 ? 'Zəif tələffüz' : 'Təmiz');
+              const gopStr = b.gop !== null ? `GOP ${b.gop.toFixed(1)}` : 'GOP —';
+              const repStr = b.repGain !== null && b.repGain >= 3.5 ? ` · Təkrar +${b.repGain.toFixed(1)}` : '';
+              const showHeard =
+                badgeCls !== 'ok' &&
+                b.heard &&
+                b.expected &&
+                normalizeZipformerTranscript(b.heard) !== normalizeZipformerTranscript(b.expected);
+              const heardStr = showHeard ? ` · eşidilən: <span dir="rtl">${b.heard}</span>` : '';
+              const distStr = `məsafə ${b.distance.toFixed(2)}`;
+              const hasUserClip = Boolean(api?.hasClip?.(b.surah, b.ayah));
+              const mineBtn =
+                badgeCls !== 'ok' && hasUserClip
+                  ? `<button type="button" class="t-tel-mine" data-s="${b.surah}" data-a="${b.ayah}" title="Öz səsimi dinlə">🎙️</button>`
+                  : '';
+              const listenBtn =
+                badgeCls !== 'ok'
+                  ? `<button type="button" class="t-tel-play" data-s="${b.surah}" data-a="${b.ayah}" title="Qarini dinlə">🔊</button>`
+                  : '';
+              return `
+                <div class="t-tel-row">
+                  <span class="t-tel-word" dir="rtl">${b.wordText}</span>
+                  <span class="t-tel-loc">${b.surah}:${b.ayah} · #${b.word + 1}</span>
+                  <span class="t-tel-meta">${distStr} · ${gopStr}${repStr}${heardStr}</span>
+                  <span class="t-tel-badge ${badgeCls}">${badgeLbl} · ${b.wordScorePercent}%</span>
+                  ${mineBtn}${listenBtn}
+                </div>
+              `;
+            })
+            .join('');
+
+    const rawTjFound = window.__tj?.found ?? [];
+    const tjItems = rawTjFound.slice(-6).reverse().map(formatTajweedFindingAz);
+    const tajweedSectionHtml =
+      tjItems.length > 0
+        ? `
+          <div class="t-tel-tj">
+            <span class="t-tel-stream-lbl">Təcvid Qaydaları Yoxlaması (${rawTjFound.length}):</span>
+            <div class="t-tel-tj-list">
+              ${tjItems
+                .map(
+                  (t) => `
+                  <button type="button" class="t-tel-tj-chip" data-s="${t.surah}" data-a="${t.ayah}" data-w="${t.word}" title="${t.detailAz}">
+                    <span dir="rtl" class="t-tel-tj-w">${t.wordText}</span>
+                    <span>${t.ruleLabelAz} · ${t.surah}:${t.ayah}</span>
+                  </button>`
+                )
+                .join('')}
+            </div>
+          </div>`
+        : '';
+
+    const { weakAreas, recurringSpots } = aggregateWeakAreas(sessionHistory);
+    const historyBodyHtml =
+      sessionHistory.length === 0
+        ? `<div class="t-tel-empty">Hələ qeyd edilmiş təlim sessiyası yoxdur. Qiraət edib mikrofonu söndürdüyünüzdə real nəticələr və çətinlik çəkdiyiniz məxrəclər burada toplanacaq.</div>`
+        : `
+          ${
+            weakAreas.length > 0
+              ? `
+            <div class="t-tel-weak-box">
+              <div class="t-tel-subhead">Ən Çox Təkrarlanan Zəif Mövzular</div>
+              <div class="t-tel-weak-list">
+                ${weakAreas
+                  .map(
+                    (wa) => `
+                  <div class="t-tel-weak-item">
+                    <div class="t-tel-weak-head">
+                      <b><bdi>${wa.tag}</bdi></b>
+                      <span>${wa.count} dəfə</span>
+                    </div>
+                    <p class="t-tel-weak-tip">${wa.tipAz}</p>
+                  </div>`
+                  )
+                  .join('')}
+              </div>
+            </div>`
+              : ''
+          }
+          ${
+            recurringSpots.length > 0
+              ? `
+            <div class="t-tel-spots-box">
+              <div class="t-tel-subhead">Məşq tələb edən sözlər (kliklə → məşq et)</div>
+              <div class="t-tel-tj-list">
+                ${recurringSpots
+                  .map(
+                    (sp) => `
+                  <button type="button" class="t-tel-spot-chip" data-s="${sp.surah}" data-a="${sp.ayah}" data-w="${sp.word}">
+                    <bdi dir="rtl" class="t-tel-tj-w">${sp.wordText}</bdi>
+                    <span><bdi>${sp.surah}:${sp.ayah}</bdi> · <bdi>${sp.tag}</bdi> (${sp.count}x)</span>
+                  </button>`
+                  )
+                  .join('')}
+              </div>
+            </div>`
+              : ''
+          }
+          <div class="t-tel-subhead-row">
+            <span class="t-tel-subhead">Son Qiraət Sessiyaları</span>
+            <button type="button" class="t-tel-clear-hist">Tarixçəni təmizlə</button>
+          </div>
+          <div class="t-tel-list">
+            ${sessionHistory
+              .map((h) => {
+                const dtStr = new Date(h.timestamp).toLocaleTimeString('az-AZ', {
+                  hour: '2-digit',
+                  minute: '2-digit',
+                });
+                const cls = h.scorePercent >= 88 ? 'ok' : h.scorePercent >= 70 ? 'warn' : 'bad';
+                return `
+                  <div class="t-tel-row">
+                    <span class="t-tel-loc">Səh. ${h.page} (${h.surah}:${h.ayahFrom}${h.ayahTo > h.ayahFrom ? `–${h.ayahTo}` : ''})</span>
+                    <span class="t-tel-meta">${dtStr} · ${h.evaluatedWords} söz · ${h.errorWords} xəta</span>
+                    <span class="t-tel-badge ${cls}">${h.scorePercent}%</span>
+                    <button type="button" class="t-tel-go-page" data-p="${h.page}">Keç</button>
+                  </div>`;
+              })
+              .join('')}
+          </div>`;
+
+    const practiceBtnHtml =
+      activeMistakes.length > 0
+        ? `<button type="button" class="t-tel-practice">Xətalı yerləri məşq et (${activeMistakes.length})</button>`
+        : '';
+
+    const currentBodyHtml = `
+      <div class="t-tel-summary">
+        <div class="t-tel-kpi">
+          <span>Real Dəqiqlik</span>
+          <b>${score.hasData && score.scorePercent !== null ? `${score.scorePercent}%` : '—'}</b>
+        </div>
+        <div class="t-tel-kpi">
+          <span>Söz sayı</span>
+          <b>${score.evaluatedWords}</b>
+        </div>
+        <div class="t-tel-kpi">
+          <span>Təmiz / Şübhəli / Xəta</span>
+          <b>${score.cleanWords} / ${score.unsureWords} / ${score.errorWords}</b>
+        </div>
+        <div class="t-tel-kpi">
+          <span>Orta Məsafə / GOP</span>
+          <b>${score.hasData ? `${score.avgDistance.toFixed(2)} / ${score.avgGop !== null ? score.avgGop.toFixed(1) : '—'}` : '—'}</b>
+        </div>
+      </div>
+      <div class="t-tel-stream">
+        <span class="t-tel-stream-lbl">Modelin eşitdiyi canlı axın:</span>
+        <div class="t-tel-stream-val" dir="rtl">${acousticText || 'Səs gözlənilir…'}</div>
+      </div>
+      ${tajweedSectionHtml}
+      <div class="t-tel-list">${rowsHtml}</div>
+    `;
+
+    telemetrySheet.innerHTML = `
+      <div class="t-sheet-box t-tel-box">
+        <div class="t-sheet-h">
+          <b>Real Akustik Nəticələr</b>
+          <div class="t-tel-head-actions">
+            ${practiceBtnHtml}
+            <button type="button" class="t-sheet-x">Bağla</button>
+          </div>
+        </div>
+        <div class="t-tel-tabs" role="tablist">
+          <button type="button" class="t-tel-tab ${telemetryTab === 'current' ? 'active' : ''}" data-tab="current">Bu Qiraət</button>
+          <button type="button" class="t-tel-tab ${telemetryTab === 'history' ? 'active' : ''}" data-tab="history">Tarixçə və Zəif Məxrəclər (${sessionHistory.length})</button>
+        </div>
+        ${telemetryTab === 'current' ? currentBodyHtml : historyBodyHtml}
+      </div>
+    `;
+
+    telemetrySheet.querySelector('.t-sheet-x')?.addEventListener('click', () => {
+      if (telemetrySheet) telemetrySheet.hidden = true;
+    });
+    telemetrySheet.querySelectorAll('.t-tel-tab').forEach((el) => {
+      el.addEventListener('click', () => {
+        const nextTab = (el as HTMLButtonElement).dataset.tab;
+        if (nextTab === 'current' || nextTab === 'history') {
+          telemetryTab = nextTab;
+          renderTelemetrySheet();
+        }
+      });
+    });
+    telemetrySheet.querySelector('.t-tel-practice')?.addEventListener('click', () => {
+      const first = window.__tartilApi?.getMistakes?.()?.[0];
+      if (telemetrySheet) telemetrySheet.hidden = true;
+      if (first) {
+        isGuidedDrillActive = true;
+        window.__tartilApi?.retrySpot?.(first.s, first.a, first.w);
+      }
+    });
+    telemetrySheet.querySelectorAll('.t-tel-play').forEach((el) => {
+      el.addEventListener('click', () => {
+        const btn = el as HTMLButtonElement;
+        const s = Number(btn.dataset.s || 0);
+        const a = Number(btn.dataset.a || 0);
+        if (s && a) playReciterAyah(s, a, btn);
+      });
+    });
+    telemetrySheet.querySelectorAll('.t-tel-mine').forEach((el) => {
+      el.addEventListener('click', () => {
+        const btn = el as HTMLButtonElement;
+        const s = Number(btn.dataset.s || 0);
+        const a = Number(btn.dataset.a || 0);
+        if (s && a) window.__tartilApi?.playMine?.(s, a);
+      });
+    });
+    telemetrySheet.querySelectorAll('.t-tel-tj-chip, .t-tel-spot-chip').forEach((el) => {
+      el.addEventListener('click', () => {
+        const btn = el as HTMLButtonElement;
+        const s = Number(btn.dataset.s || 0);
+        const a = Number(btn.dataset.a || 0);
+        const w = Number(btn.dataset.w ?? -1);
+        if (telemetrySheet) telemetrySheet.hidden = true;
+        if (s && a) window.__tartilApi?.retrySpot?.(s, a, w);
+      });
+    });
+    telemetrySheet.querySelectorAll('.t-tel-go-page').forEach((el) => {
+      el.addEventListener('click', () => {
+        const p = Number((el as HTMLButtonElement).dataset.p || 0);
+        if (telemetrySheet) telemetrySheet.hidden = true;
+        if (p > 0) window.__tartilApi?.goToPage?.(p);
+      });
+    });
+    telemetrySheet.querySelector('.t-tel-clear-hist')?.addEventListener('click', () => {
+      sessionHistory = [];
+      clearRecitationHistoryStorage();
+      renderTelemetrySheet();
+    });
+  };
+
+  telemetrySheet.addEventListener('click', (ev) => {
+    if (ev.target === telemetrySheet && telemetrySheet) {
+      telemetrySheet.hidden = true;
+    }
+  });
+
+  barScorePill?.addEventListener('click', () => {
+    if (!telemetrySheet) return;
+    syncVerdictsFromEngine();
+    telemetrySheet.hidden = !telemetrySheet.hidden;
+    if (!telemetrySheet.hidden) {
+      renderTelemetrySheet();
+    }
+  });
+
   const updateScorePill = () => {
     if (!barScorePill) return;
-    const st = window.__tartilApi?.getState?.();
-    if (!st) return;
-    const correct = Math.max(0, st.revealedCount);
-    const errors = Math.max(0, st.mistakes);
-    const total = correct + errors;
-    const pct = total > 0 ? Math.round((100 * correct) / total) : 100;
-    barScorePill.textContent = `${pct}%`;
-    barScorePill.classList.toggle('warn', pct < 90 && pct >= 70);
-    barScorePill.classList.toggle('bad', pct < 70);
+    syncVerdictsFromEngine();
+    const score = computeCurrentRealScore();
+    if (!score.hasData || score.scorePercent === null) {
+      barScorePill.textContent = 'Nəticə: —';
+      barScorePill.classList.add('idle');
+      barScorePill.classList.remove('warn', 'bad');
+    } else {
+      const pct = score.scorePercent;
+      barScorePill.textContent = `${pct}% · ${score.evaluatedWords} söz`;
+      barScorePill.classList.remove('idle');
+      barScorePill.classList.toggle('warn', pct < 88 && pct >= 70);
+      barScorePill.classList.toggle('bad', pct < 70);
+    }
+    if (telemetrySheet && !telemetrySheet.hidden) {
+      renderTelemetrySheet();
+    }
   };
 
   // 3. Create Live Mistake Radar Banner (.t-alert-banner) anchored above the bottom bar
@@ -406,6 +854,16 @@ export function attachHybridVoiceBooster(rootEl: HTMLElement): () => void {
     const heardPart = item.heardWord
       ? `<span class="t-alert-heard" dir="ltr">Eşidilən: <b dir="rtl">${item.heardWord}</b></span>`
       : '';
+    const tipText = getArticulationTipAz({
+      kind: item.kind,
+      expectedWord: item.expectedWord,
+      heardWord: item.heardWord,
+      note: item.explanationAz,
+    });
+    const hasMyClip = Boolean(window.__tartilApi?.hasClip?.(item.surah, item.ayah));
+    const mineBtnHtml = hasMyClip
+      ? `<button type="button" class="t-alert-mine" title="Bu ayədə öz qiraət səsinizi dinləyin">🎙️ Öz səsim</button>`
+      : '';
 
     alertBanner.innerHTML = `
       <div class="t-alert-main">
@@ -420,9 +878,11 @@ export function attachHybridVoiceBooster(rootEl: HTMLElement): () => void {
             ${heardPart}
           </div>
           <p class="t-alert-desc" dir="ltr">${item.explanationAz}</p>
+          <p class="t-alert-tip" dir="ltr"><b>💡 Məsləhət:</b> ${tipText}</p>
         </div>
         <div class="t-alert-actions">
-          <button type="button" class="t-alert-listen" title="Şeyx Husari / Əfasi tilavətini dinlə">🔊 Qarini dinlə</button>
+          ${mineBtnHtml}
+          <button type="button" class="t-alert-listen" title="Şeyx Husari / Minşəvi / Əfasi tilavətini dinlə">🔊 Qarini dinlə</button>
           <button type="button" class="t-alert-retry">İndi düzəlt (Təkrar oxu)</button>
         </div>
       </div>
@@ -432,6 +892,11 @@ export function attachHybridVoiceBooster(rootEl: HTMLElement): () => void {
     const closeBtn = alertBanner.querySelector('.t-alert-close');
     closeBtn?.addEventListener('click', () => {
       if (alertBanner) alertBanner.hidden = true;
+    });
+
+    const mineBtn = alertBanner.querySelector('.t-alert-mine') as HTMLButtonElement | null;
+    mineBtn?.addEventListener('click', () => {
+      window.__tartilApi?.playMine?.(item.surah, item.ayah);
     });
 
     const listenBtn = alertBanner.querySelector('.t-alert-listen') as HTMLButtonElement | null;
@@ -447,7 +912,7 @@ export function attachHybridVoiceBooster(rootEl: HTMLElement): () => void {
 
     bannerHideTimer = window.setTimeout(() => {
       if (alertBanner) alertBanner.hidden = true;
-    }, 12000);
+    }, 14000);
   };
 
   // Listen to `tartil-mistake` events emitted by `ke(e)` in `tartil-engine.js`
@@ -463,14 +928,33 @@ export function attachHybridVoiceBooster(rootEl: HTMLElement): () => void {
     const expectedWord =
       detail.expectedWord || (word >= 0 && plainWords[word] ? plainWords[word] : `Ayə ${ayah}`);
 
+    const cachedVerdict = word >= 0 ? sessionVerdictCache.get(`${surah}:${ayah}:${word}`) : undefined;
+    const perWordMakhraj =
+      cachedVerdict && kind === 'possible_substitution'
+        ? diagnosePerWordPhonemeMakhraj(cachedVerdict.expected, cachedVerdict.heard, {
+            distance: cachedVerdict.distance,
+            gop: cachedVerdict.gop,
+            state: cachedVerdict.state,
+          })
+        : null;
+
+    const resolvedHeard =
+      detail.heardWord ||
+      perWordMakhraj?.heardSegment ||
+      (cachedVerdict?.heard && cachedVerdict.heard !== cachedVerdict.expected
+        ? cachedVerdict.heard
+        : undefined);
+
     const defaultExplanation =
-      kind === 'possible_vowel'
-        ? `\u200EHərəkə xətası (${expectedWord}): fəthə/kəsrə/zəmmə yanlış tələffüz edildi`
-        : kind === 'possible_omission'
-          ? `\u200ESöz buraxıldı: «${expectedWord}» oxunmadan ötürüldü`
-          : kind === 'possible_repetition'
-            ? `\u200ETəkrar xətası: «${expectedWord}» sözü təkrar oxundu`
-            : `\u200ETələffüz / Məxrəc xətası (${expectedWord}): hərf və ya söz səhv oxundu`;
+      perWordMakhraj
+        ? `\u200EMəxrəc xətası (${expectedWord}): ${perWordMakhraj.confusion.descriptionAz}`
+        : kind === 'possible_vowel'
+          ? `\u200EHərəkə xətası (${expectedWord}): fəthə/kəsrə/zəmmə yanlış tələffüz edildi`
+          : kind === 'possible_omission'
+            ? `\u200ESöz buraxıldı: «${expectedWord}» oxunmadan ötürüldü`
+            : kind === 'possible_repetition'
+              ? `\u200ETəkrar xətası: «${expectedWord}» sözü təkrar oxundu`
+              : `\u200ETələffüz / Məxrəc xətası (${expectedWord}): hərf və ya söz səhv oxundu`;
 
     const alertItem: MistakeAlertItem = {
       surah,
@@ -478,10 +962,14 @@ export function attachHybridVoiceBooster(rootEl: HTMLElement): () => void {
       word,
       kind,
       surahName: detail.surahName || `Surə ${surah}`,
-      titleAz: detail.titleAz || detail.kindLabel || 'Tələffüz xətası',
+      titleAz:
+        detail.titleAz ||
+        (perWordMakhraj
+          ? `Hərf məxrəci xətası (${perWordMakhraj.confusion.expectedLetter} → ${perWordMakhraj.confusion.heardLetter})`
+          : detail.kindLabel || 'Tələffüz xətası'),
       explanationAz: detail.note || defaultExplanation,
       expectedWord,
-      heardWord: detail.heardWord,
+      heardWord: resolvedHeard,
       timestamp: Date.now(),
     };
 
@@ -501,6 +989,126 @@ export function attachHybridVoiceBooster(rootEl: HTMLElement): () => void {
   };
 
   window.addEventListener('tartil-mistake', onTartilMistakeEvent);
+
+  const onTartilFinalVerdicts = (ev: Event) => {
+    const detail = (ev as CustomEvent).detail || {};
+    const finalVerdicts = Array.isArray(detail.verdicts) ? detail.verdicts : [];
+    const finalTranscript = typeof detail.transcript === 'string' ? detail.transcript : '';
+    syncVerdictsFromEngine(true, finalVerdicts, finalTranscript);
+    persistCompletedSession();
+    updateScorePill();
+  };
+  window.addEventListener('tartil-final-verdicts', onTartilFinalVerdicts);
+
+  const onTartilTjFound = (ev: Event) => {
+    const api = window.__tartilApi;
+    if (!api) return;
+    const detail = (ev as CustomEvent).detail || {};
+    const items = Array.isArray(detail.items) ? detail.items : [];
+    if (items.length === 0) return;
+
+    const promoted = evaluateTajweedFindingsForMistakes(
+      items,
+      getWordPlainText,
+      Array.from(sessionVerdictCache.values())
+    );
+    if (promoted.length === 0) return;
+
+    const existing = api.getMistakes?.() ?? [];
+    for (const m of promoted) {
+      const mKey = `${m.surah}:${m.ayah}:${m.word}`;
+      if (autoFlaggedKeys.has(mKey)) continue;
+      const already = existing.find((e) => e.s === m.surah && e.a === m.ayah && e.w === m.word);
+      if (already) {
+        if (!already.note && m.explanationAz) {
+          api.enrichMistakeNote?.(m.surah, m.ayah, m.word, m.explanationAz);
+        }
+        autoFlaggedKeys.add(mKey);
+        continue;
+      }
+      autoFlaggedKeys.add(mKey);
+      api.flagMistake?.({
+        surah: m.surah,
+        ayah: m.ayah,
+        word: m.word,
+        kind: m.kind,
+        note: m.explanationAz,
+        expectedWord: m.expectedWord,
+        heardWord: m.heardWord,
+        titleAz: m.titleAz,
+      });
+    }
+    updateScorePill();
+  };
+  window.addEventListener('tartil-tj-found', onTartilTjFound);
+
+  const onTartilMistakesCleared = () => {
+    recentAlerts.length = 0;
+    sessionVerdictCache.clear();
+    autoFlaggedKeys.clear();
+    lastLiveAcousticTranscript = '';
+    isGuidedDrillActive = false;
+    if (alertBanner) alertBanner.hidden = true;
+    updateScorePill();
+  };
+  window.addEventListener('tartil-mistakes-cleared', onTartilMistakesCleared);
+
+  const onTartilMistakeFixed = (ev: Event) => {
+    const detail = (ev as CustomEvent).detail || {};
+    const surah = Number(detail.surah || 0);
+    const ayah = Number(detail.ayah || 0);
+    const word = typeof detail.word === 'number' ? detail.word : -1;
+    if (!surah || !ayah) return;
+
+    if (word >= 0) {
+      const key = `${surah}:${ayah}:${word}`;
+      autoFlaggedKeys.delete(key);
+      const existingVerdict = sessionVerdictCache.get(key);
+      if (existingVerdict && existingVerdict.state !== 'ok') {
+        sessionVerdictCache.set(key, {
+          ...existingVerdict,
+          state: 'ok',
+          distance: 0,
+          heardRatio: 1,
+          vowelErrors: 0,
+          repGain: undefined,
+          slip: undefined,
+        });
+      }
+    } else {
+      const prefix = `${surah}:${ayah}:`;
+      for (const k of Array.from(autoFlaggedKeys)) {
+        if (k.startsWith(prefix)) autoFlaggedKeys.delete(k);
+      }
+    }
+
+    let removedTop = false;
+    for (let idx = recentAlerts.length - 1; idx >= 0; idx--) {
+      const item = recentAlerts[idx];
+      if (item.surah === surah && item.ayah === ayah && (word < 0 || item.word === word)) {
+        if (idx === 0) removedTop = true;
+        recentAlerts.splice(idx, 1);
+      }
+    }
+    if (removedTop && alertBanner) {
+      alertBanner.hidden = true;
+    }
+    updateScorePill();
+
+    // Guided Mistake Drill Loop: auto-step to the next remaining mistake if drill mode is active
+    if (isGuidedDrillActive) {
+      const remaining = window.__tartilApi?.getMistakes?.() ?? [];
+      if (remaining.length > 0) {
+        const nextSpot = remaining[0];
+        window.setTimeout(() => {
+          window.__tartilApi?.retrySpot?.(nextSpot.s, nextSpot.a, nextSpot.w);
+        }, 550);
+      } else {
+        isGuidedDrillActive = false;
+      }
+    }
+  };
+  window.addEventListener('tartil-mistake-fixed', onTartilMistakeFixed);
 
   const updateBoostUi = (mode: VoiceBoostMode) => {
     currentBoost = mode;
@@ -570,6 +1178,31 @@ export function attachHybridVoiceBooster(rootEl: HTMLElement): () => void {
   };
   barBoostBtn?.addEventListener('click', onBarBoostClick);
 
+  const settingsHifzSeg = settingsBox?.querySelector('.t-seg[data-set="hifz"]') ?? null;
+  const onBarHifzClick = () => {
+    const nextVal = isHifzActive() ? '0' : '1';
+    const targetBtn = settingsBox?.querySelector(
+      `.t-seg[data-set="hifz"] button[data-v="${nextVal}"]`
+    ) as HTMLButtonElement | null;
+    if (targetBtn) {
+      targetBtn.click();
+    } else {
+      rootEl.classList.toggle('hifz', nextVal === '1');
+      try {
+        localStorage.setItem('tartil.hifz', nextVal);
+      } catch {
+        // ignore
+      }
+    }
+    syncHifzPillUi();
+  };
+  barHifzBtn?.addEventListener('click', onBarHifzClick);
+
+  const onSettingsHifzClick = () => {
+    window.setTimeout(syncHifzPillUi, 0);
+  };
+  settingsHifzSeg?.addEventListener('click', onSettingsHifzClick);
+
   // 4. Never advance words on RMS energy.
   window.__onTartilRms = undefined;
 
@@ -620,8 +1253,16 @@ export function attachHybridVoiceBooster(rootEl: HTMLElement): () => void {
       return judgeAttemptTilawi(expected, heardWords);
     },
     getRecentAlerts: () => [...recentAlerts],
+    getRealScore: () => {
+      syncVerdictsFromEngine();
+      return computeCurrentRealScore();
+    },
+    getSessionHistory: () => [...sessionHistory],
     clearAlerts: () => {
       recentAlerts.length = 0;
+      sessionVerdictCache.clear();
+      autoFlaggedKeys.clear();
+      lastLiveAcousticTranscript = '';
       if (alertBanner) alertBanner.hidden = true;
       window.__tartilApi?.clearMistakes?.();
       updateScorePill();
@@ -632,7 +1273,6 @@ export function attachHybridVoiceBooster(rootEl: HTMLElement): () => void {
   // 5. Parallel Browser Web Speech API (ar-SA) Assist — strictly confirms ONLY final exact-matching words, NEVER flags false mistakes on Qari Tajweed/Madd
   let recognition: any = null;
   let speechActive = false;
-  let stitchedWindowWords: string[] = [];
   let lastProcessedTranscript = '';
 
   const startWebSpeechAssist = () => {
@@ -714,13 +1354,24 @@ export function attachHybridVoiceBooster(rootEl: HTMLElement): () => void {
   const micInterval = window.setInterval(() => {
     const api = window.__tartilApi;
     const isMic = api?.isMicOn() ?? false;
+    if (isMic && !prevMicState) {
+      // Starting a fresh microphone session clears previous session telemetry so results belong to this recitation
+      sessionVerdictCache.clear();
+      autoFlaggedKeys.clear();
+      lastLiveAcousticTranscript = '';
+    } else if (!isMic && prevMicState) {
+      // Final flush when mic stops
+      syncVerdictsFromEngine(true);
+      persistCompletedSession();
+    }
+    prevMicState = isMic;
     if (isMic && !speechActive) {
       startWebSpeechAssist();
     } else if (!isMic && speechActive) {
       stopWebSpeechAssist();
     }
     updateScorePill();
-  }, 400);
+  }, 350);
 
   return () => {
     window.clearInterval(micInterval);
@@ -730,12 +1381,19 @@ export function attachHybridVoiceBooster(rootEl: HTMLElement): () => void {
       activeAudio = null;
     }
     window.removeEventListener('tartil-mistake', onTartilMistakeEvent);
+    window.removeEventListener('tartil-final-verdicts', onTartilFinalVerdicts);
+    window.removeEventListener('tartil-tj-found', onTartilTjFound);
+    window.removeEventListener('tartil-mistakes-cleared', onTartilMistakesCleared);
+    window.removeEventListener('tartil-mistake-fixed', onTartilMistakeFixed);
     stopWebSpeechAssist();
     boostRow?.removeEventListener('click', onBoostRowClick);
     reciterRow?.removeEventListener('click', onReciterRowClick);
     slipHoldRow?.removeEventListener('click', onSlipHoldRowClick);
     barBoostBtn?.removeEventListener('click', onBarBoostClick);
+    barHifzBtn?.removeEventListener('click', onBarHifzClick);
+    settingsHifzSeg?.removeEventListener('click', onSettingsHifzClick);
     alertBanner?.remove();
+    telemetrySheet?.remove();
     window.__onTartilRms = undefined;
   };
 }
